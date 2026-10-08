@@ -1,65 +1,64 @@
 const express = require('express');
-const router = express.Router();
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
-const { authenticateToken } = require('../middleware/auth');
-require('dotenv').config();
+const { randomUUID } = require('crypto');
+const { authenticateToken, requireAdmin } = require('../middleware/auth');
 
-const cloudinaryConfigured = Boolean(
-  process.env.CLOUDINARY_CLOUD_NAME &&
-  process.env.CLOUDINARY_API_KEY &&
+const router = express.Router();
+const acceptedImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/avif', 'image/gif']);
+const hasRealCredential = (value) => Boolean(value && !/^(replace|change)[-_ ]/i.test(value));
+const cloudinaryConfigured = [
+  process.env.CLOUDINARY_CLOUD_NAME,
+  process.env.CLOUDINARY_API_KEY,
   process.env.CLOUDINARY_API_SECRET
-);
+].every(hasRealCredential);
 
 if (cloudinaryConfigured) {
   cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
     api_key: process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+    secure: true
   });
 }
 
-// Configure Multer for in-memory buffer storage
-const storage = multer.memoryStorage();
 const upload = multer({
-  storage,
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+  fileFilter(req, file, callback) {
+    if (!acceptedImageTypes.has(file.mimetype)) {
+      return callback(new Error('Only JPEG, PNG, WebP, AVIF, and GIF images are accepted.'));
+    }
+    callback(null, true);
+  }
 });
 
-// POST /api/upload (Protected Admin Endpoint)
-router.post('/', authenticateToken, upload.single('file'), async (req, res) => {
+router.post('/', authenticateToken, requireAdmin, (req, res, next) => {
+  if (!cloudinaryConfigured) {
+    return res.status(503).json({ error: 'Image uploads are not configured.' });
+  }
+  upload.single('file')(req, res, (error) => {
+    if (error) return next(error);
+    next();
+  });
+}, async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No image file provided for upload.' });
+
   try {
-    if (!cloudinaryConfigured) {
-      return res.status(503).json({ error: 'Image uploads are not configured.' });
-    }
+    const result = await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        {
+          folder: 'velocad_engineering',
+          public_id: randomUUID(),
+          resource_type: 'image',
+          allowed_formats: ['jpg', 'jpeg', 'png', 'webp', 'avif', 'gif']
+        },
+        (error, uploaded) => error ? reject(error) : resolve(uploaded)
+      );
+      stream.end(req.file.buffer);
+    });
 
-    if (!req.file) {
-      return res.status(400).json({ error: 'No image file provided for upload.' });
-    }
-
-    // Stream buffer to Cloudinary
-    const streamUpload = (fileBuffer) => {
-      return new Promise((resolve, reject) => {
-        const stream = cloudinary.uploader.upload_stream(
-          {
-            folder: 'velocad_engineering',
-            resource_type: 'auto'
-          },
-          (error, result) => {
-            if (result) {
-              resolve(result);
-            } else {
-              reject(error);
-            }
-          }
-        );
-        stream.end(fileBuffer);
-      });
-    };
-
-    const result = await streamUpload(req.file.buffer);
-
-    res.json({
+    res.status(201).json({
       message: 'Image uploaded successfully to Cloudinary',
       url: result.secure_url,
       public_id: result.public_id,
@@ -69,7 +68,7 @@ router.post('/', authenticateToken, upload.single('file'), async (req, res) => {
     });
   } catch (error) {
     console.error('Cloudinary upload error:', error);
-    res.status(500).json({ error: 'Failed to upload image to Cloudinary.' });
+    res.status(502).json({ error: 'Failed to upload image to Cloudinary.' });
   }
 });
 

@@ -1,0 +1,115 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "mysql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+
+model User {
+  id           String   @id @db.VarChar(64)
+  username     String   @db.VarChar(191)
+  email        String   @unique @db.VarChar(191)
+  passwordHash String   @map("password_hash") @db.VarChar(255)
+  role         String   @default("admin") @db.VarChar(32)
+  createdAt    DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@map("users")
+}
+
+model Product {
+  id          String   @id @db.VarChar(64)
+  name        String   @db.VarChar(191)
+  category    String   @db.VarChar(100)
+  price       Decimal  @db.Decimal(10, 2)
+  description String   @db.Text
+  features    Json     @map("features_json")
+  imageUrl    String   @map("image_url") @db.Text
+  createdAt   DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@index([createdAt])
+  @@map("products")
+}
+
+model Vehicle {
+  id             String   @id @db.VarChar(64)
+  name           String   @db.VarChar(191)
+  slug           String   @unique @db.VarChar(191)
+  years          String   @db.VarChar(64)
+  description    String   @db.Text
+  features       Json     @map("features_json")
+  specifications Json     @map("specs_json")
+  gallery        Json     @map("gallery_json")
+  createdAt      DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@map("vehicles")
+}
+
+model ConfiguratorStep {
+  id          String               @id @db.VarChar(64)
+  order       Int                  @map("step_order")
+  title       String               @db.VarChar(191)
+  description String               @db.Text
+  icon        String               @map("icon_name") @db.VarChar(100)
+  options     ConfiguratorOption[]
+
+  @@map("configurator_steps")
+}
+
+model ConfiguratorOption {
+  id          String           @id @db.VarChar(64)
+  stepId      String           @map("step_id") @db.VarChar(64)
+  sortOrder   Int              @default(0) @map("sort_order")
+  name        String           @db.VarChar(191)
+  description String           @db.Text
+  price       Decimal          @db.Decimal(10, 2)
+  features    Json             @map("features_json")
+  step        ConfiguratorStep @relation(fields: [stepId], references: [id], onDelete: Cascade)
+
+  @@index([stepId, sortOrder])
+  @@map("configurator_options")
+}
+
+model Inquiry {
+  id              String   @id @db.VarChar(64)
+  clientName      String   @map("client_name") @db.VarChar(191)
+  email           String   @db.VarChar(191)
+  phone           String   @db.VarChar(64)
+  notes           String   @db.Text
+  selectedOptions Json     @map("selected_options_json")
+  totalEstimate   Decimal  @map("total_estimate") @db.Decimal(10, 2)
+  status          String   @default("New") @db.VarChar(32)
+  createdAt       DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@index([createdAt])
+  @@map("inquiries")
+}
+
+model ContactMessage {
+  id        String   @id @db.VarChar(64)
+  name      String   @db.VarChar(191)
+  email     String   @db.VarChar(191)
+  phone     String   @default("") @db.VarChar(64)
+  vehicle   String   @default("") @db.VarChar(191)
+  message   String   @db.Text
+  status    String   @default("New") @db.VarChar(32)
+  createdAt DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@index([createdAt])
+  @@map("contact_messages")
+}
+
+model GalleryItem {
+  id          String   @id @db.VarChar(64)
+  title       String   @db.VarChar(191)
+  category    String   @db.VarChar(100)
+  imageUrl    String   @map("image_url") @db.Text
+  description String   @db.Text
+  vehicleTag  String   @map("vehicle_tag") @db.VarChar(191)
+  createdAt   DateTime @default(now()) @map("created_at") @db.DateTime(3)
+
+  @@index([createdAt])
+  @@map("gallery")
+}
