@@ -1,110 +1,119 @@
 const express = require('express');
-const router = express.Router();
-const { all, get, run } = require('../db/database');
-const { authenticateToken } = require('../middleware/auth');
+const { randomUUID } = require('crypto');
+const prisma = require('../db/database');
+const { authenticateToken, requireAdmin } = require('../middleware/auth');
+const { optionResponse } = require('../db/serializers');
 
-// GET /api/configurator (Public - returns all steps and options)
+const router = express.Router();
+
+function validPrice(price) {
+  if (!['number', 'string'].includes(typeof price) || String(price).trim() === '') return false;
+  const value = Number(price);
+  return Number.isFinite(value) && value >= 0 && value <= 99999999.99 &&
+    Math.abs(Math.round(value * 100) - value * 100) < 1e-8;
+}
+
+function validFeatures(features) {
+  return Array.isArray(features) &&
+    features.length <= 50 &&
+    features.every((feature) => typeof feature === 'string' && feature.length <= 200);
+}
+
 router.get('/', async (req, res) => {
   try {
-    const steps = await all('SELECT * FROM configurator_steps ORDER BY step_order ASC');
-    const options = await all('SELECT * FROM configurator_options');
-
-    const formattedSteps = steps.map(s => {
-      const stepOptions = options
-        .filter(o => o.step_id === s.id)
-        .map(o => ({
-          ...o,
-          features: o.features_json ? JSON.parse(o.features_json) : []
-        }));
-
-      return {
-        id: s.id,
-        order: s.step_order,
-        title: s.title,
-        description: s.description,
-        icon: s.icon_name,
-        options: stepOptions
-      };
+    const steps = await prisma.configuratorStep.findMany({
+      orderBy: { order: 'asc' },
+      include: { options: { orderBy: { sortOrder: 'asc' } } }
     });
-
-    res.json(formattedSteps);
+    res.json(steps.map((step) => ({
+      id: step.id,
+      order: step.order,
+      title: step.title,
+      description: step.description,
+      icon: step.icon,
+      options: step.options.map(optionResponse)
+    })));
   } catch (error) {
     console.error('Error fetching configurator configuration:', error);
     res.status(500).json({ error: 'Failed to fetch configurator configuration.' });
   }
 });
 
-// POST /api/configurator/options (Admin Protected)
-router.post('/options', authenticateToken, async (req, res) => {
+router.post('/options', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { step_id, name, description, price, features } = req.body;
-    if (!step_id || !name || price === undefined) {
-      return res.status(400).json({ error: 'step_id, name, and price are required.' });
+    const { step_id, name, description, price, features } = req.body || {};
+    if (
+      typeof step_id !== 'string' || !step_id ||
+      typeof name !== 'string' || !name.trim() ||
+      name.trim().length > 191 ||
+      !validPrice(price) ||
+      (description !== undefined && (typeof description !== 'string' || description.length > 20000)) ||
+      (features !== undefined && !validFeatures(features))
+    ) {
+      return res.status(400).json({ error: 'step_id, name, a valid price, and valid option details are required.' });
     }
 
-    const id = 'opt_' + Date.now();
-    const featuresJson = JSON.stringify(Array.isArray(features) ? features : []);
-
-    await run(
-      'INSERT INTO configurator_options (id, step_id, name, description, price, features_json) VALUES (?, ?, ?, ?, ?, ?)',
-      [id, step_id, name, description || '', parseFloat(price), featuresJson]
-    );
-
-    const created = await get('SELECT * FROM configurator_options WHERE id = ?', [id]);
-    res.status(201).json({
-      ...created,
-      features: created.features_json ? JSON.parse(created.features_json) : []
+    const step = await prisma.configuratorStep.findUnique({ where: { id: step_id } });
+    if (!step) return res.status(404).json({ error: 'Configurator step not found.' });
+    const lastOption = await prisma.configuratorOption.findFirst({
+      where: { stepId: step_id },
+      orderBy: { sortOrder: 'desc' },
+      select: { sortOrder: true }
     });
+
+    const option = await prisma.configuratorOption.create({
+      data: {
+        id: `opt_${randomUUID()}`,
+        stepId: step_id,
+        sortOrder: (lastOption?.sortOrder ?? -1) + 1,
+        name: name.trim(),
+        description: description || '',
+        price: Number(price),
+        features: features || []
+      }
+    });
+    res.status(201).json(optionResponse(option));
   } catch (error) {
     console.error('Error creating configurator option:', error);
     res.status(500).json({ error: 'Failed to create configurator option.' });
   }
 });
 
-// PUT /api/configurator/options/:id (Admin Protected)
-router.put('/options/:id', authenticateToken, async (req, res) => {
+router.put('/options/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { name, description, price, features } = req.body;
-    const option = await get('SELECT * FROM configurator_options WHERE id = ?', [req.params.id]);
-    if (!option) {
-      return res.status(404).json({ error: 'Configurator option not found.' });
+    const existing = await prisma.configuratorOption.findUnique({ where: { id: req.params.id } });
+    if (!existing) return res.status(404).json({ error: 'Configurator option not found.' });
+
+    const { name, description, price, features } = req.body || {};
+    if (
+      (name !== undefined && (typeof name !== 'string' || !name.trim() || name.trim().length > 191)) ||
+      (description !== undefined && (typeof description !== 'string' || description.length > 20000)) ||
+      (price !== undefined && !validPrice(price)) ||
+      (features !== undefined && !validFeatures(features))
+    ) {
+      return res.status(400).json({ error: 'Invalid configurator option fields.' });
     }
 
-    const featuresJson = JSON.stringify(Array.isArray(features) ? features : (option.features_json ? JSON.parse(option.features_json) : []));
-
-    await run(
-      `UPDATE configurator_options 
-       SET name = ?, description = ?, price = ?, features_json = ? 
-       WHERE id = ?`,
-      [
-        name || option.name,
-        description !== undefined ? description : option.description,
-        price !== undefined ? parseFloat(price) : option.price,
-        featuresJson,
-        req.params.id
-      ]
-    );
-
-    const updated = await get('SELECT * FROM configurator_options WHERE id = ?', [req.params.id]);
-    res.json({
-      ...updated,
-      features: updated.features_json ? JSON.parse(updated.features_json) : []
+    const option = await prisma.configuratorOption.update({
+      where: { id: existing.id },
+      data: {
+        ...(name !== undefined && { name: name.trim() }),
+        ...(description !== undefined && { description }),
+        ...(price !== undefined && { price: Number(price) }),
+        ...(features !== undefined && { features })
+      }
     });
+    res.json(optionResponse(option));
   } catch (error) {
     console.error('Error updating configurator option:', error);
     res.status(500).json({ error: 'Failed to update configurator option.' });
   }
 });
 
-// DELETE /api/configurator/options/:id (Admin Protected)
-router.delete('/options/:id', authenticateToken, async (req, res) => {
+router.delete('/options/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const option = await get('SELECT * FROM configurator_options WHERE id = ?', [req.params.id]);
-    if (!option) {
-      return res.status(404).json({ error: 'Configurator option not found.' });
-    }
-
-    await run('DELETE FROM configurator_options WHERE id = ?', [req.params.id]);
+    const result = await prisma.configuratorOption.deleteMany({ where: { id: req.params.id } });
+    if (result.count === 0) return res.status(404).json({ error: 'Configurator option not found.' });
     res.json({ message: 'Configurator option deleted successfully.' });
   } catch (error) {
     console.error('Error deleting configurator option:', error);

@@ -1,113 +1,31 @@
 require('dotenv').config({ path: require('path').resolve(__dirname, '..', '.env') });
 
 const bcrypt = require('bcryptjs');
-const { run, all } = require('./database');
+const prisma = require('./database');
+
+const run = (sql, params = []) => prisma.$executeRawUnsafe(sql, ...params);
+const all = (sql, params = []) => prisma.$queryRawUnsafe(sql, ...params);
 
 async function seed() {
-  console.log('Seeding SQLite Database...');
-
-  // Create Users Table
-  await run(`
-    CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      username TEXT NOT NULL,
-      email TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      role TEXT DEFAULT 'admin',
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  // Create Products Table
-  await run(`
-    CREATE TABLE IF NOT EXISTS products (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      category TEXT NOT NULL,
-      price REAL NOT NULL,
-      description TEXT,
-      features_json TEXT,
-      image_url TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  // Create Vehicles Table
-  await run(`
-    CREATE TABLE IF NOT EXISTS vehicles (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      slug TEXT UNIQUE NOT NULL,
-      years TEXT NOT NULL,
-      description TEXT,
-      features_json TEXT,
-      specs_json TEXT,
-      gallery_json TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  // Create Configurator Steps Table
-  await run(`
-    CREATE TABLE IF NOT EXISTS configurator_steps (
-      id TEXT PRIMARY KEY,
-      step_order INTEGER NOT NULL,
-      title TEXT NOT NULL,
-      description TEXT,
-      icon_name TEXT
-    )
-  `);
-
-  // Create Configurator Options Table
-  await run(`
-    CREATE TABLE IF NOT EXISTS configurator_options (
-      id TEXT PRIMARY KEY,
-      step_id TEXT NOT NULL,
-      name TEXT NOT NULL,
-      description TEXT,
-      price REAL NOT NULL,
-      features_json TEXT,
-      FOREIGN KEY (step_id) REFERENCES configurator_steps(id) ON DELETE CASCADE
-    )
-  `);
-
-  // Create Inquiries Table
-  await run(`
-    CREATE TABLE IF NOT EXISTS inquiries (
-      id TEXT PRIMARY KEY,
-      client_name TEXT,
-      email TEXT,
-      phone TEXT,
-      notes TEXT,
-      selected_options_json TEXT,
-      total_estimate REAL,
-      status TEXT DEFAULT 'New',
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  // Create Gallery Table
-  await run(`
-    CREATE TABLE IF NOT EXISTS gallery (
-      id TEXT PRIMARY KEY,
-      title TEXT NOT NULL,
-      category TEXT NOT NULL,
-      image_url TEXT NOT NULL,
-      description TEXT,
-      vehicle_tag TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
+  console.log('Seeding MySQL database...');
 
   // Seed Admin User
-  const adminEmail = process.env.ADMIN_EMAIL || 'admin@velocad.com.au';
+  const adminEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
+  if (!adminEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(adminEmail)) {
+    throw new Error('Set ADMIN_EMAIL to a valid administrator email before seeding.');
+  }
   const existingAdmin = await all('SELECT * FROM users WHERE email = ?', [adminEmail]);
   if (existingAdmin.length === 0) {
-    if (!process.env.ADMIN_PASSWORD) {
-      throw new Error('ADMIN_PASSWORD must be set before creating the initial admin user.');
+    if (
+      !process.env.ADMIN_PASSWORD ||
+      process.env.ADMIN_PASSWORD.length < 12 ||
+      process.env.ADMIN_PASSWORD.length > 256 ||
+      /^(replace|change)[-_ ]/i.test(process.env.ADMIN_PASSWORD)
+    ) {
+      throw new Error('ADMIN_PASSWORD must be set to a unique password of at least 12 characters before creating the initial admin user.');
     }
 
-    const salt = await bcrypt.genSalt(10);
+    const salt = await bcrypt.genSalt(12);
     const passwordHash = await bcrypt.hash(process.env.ADMIN_PASSWORD, salt);
     await run(
       "INSERT INTO users (id, username, email, password_hash, role) VALUES (?, ?, ?, ?, ?)",
@@ -268,33 +186,16 @@ async function seed() {
       { id: 'full-workshop-pack', step_id: 'delivery', name: 'Full Blueprint & Commercial License', description: 'Complete workshop blueprints, 1:1 DXF patterns, BOM & sign-off', price: 599, features: JSON.stringify(['1:1 scale printable shop floor blueprints', 'Full Hardware Bill of Materials (BOM) & specs', 'Commercial fabrication license included', 'Direct consultation with senior CAD engineer']) }
     ];
 
+    const sortOrders = new Map();
     for (const opt of optionsData) {
+      const sortOrder = sortOrders.get(opt.step_id) || 0;
       await run(
-        "INSERT INTO configurator_options (id, step_id, name, description, price, features_json) VALUES (?, ?, ?, ?, ?, ?)",
-        [opt.id, opt.step_id, opt.name, opt.description, opt.price, opt.features]
+        "INSERT INTO configurator_options (id, step_id, sort_order, name, description, price, features_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [opt.id, opt.step_id, sortOrder, opt.name, opt.description, opt.price, opt.features]
       );
+      sortOrders.set(opt.step_id, sortOrder + 1);
     }
     console.log('✅ Seeded Configurator Steps & Options.');
-  }
-
-  // Seed Sample Inquiry
-  const existingInquiries = await all("SELECT * FROM inquiries");
-  if (existingInquiries.length === 0) {
-    await run(
-      `INSERT INTO inquiries (id, client_name, email, phone, notes, selected_options_json, total_estimate, status) 
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        'inq_sample_1',
-        'Sarah Jenkins',
-        'sarah@outbackfleet.com.au',
-        '0412 345 678',
-        'Require custom FEA load report for 300kg roof load carrying capacity.',
-        JSON.stringify({ vehicle: 'hilux-2023', type: 'work', modules: 'tool-storage', finish: 'standard', delivery: 'dxf-fea-express' }),
-        6197.00,
-        'New'
-      ]
-    );
-    console.log('✅ Seeded Sample Inquiry.');
   }
 
   // Seed Gallery Renders
@@ -324,6 +225,9 @@ async function seed() {
 if (require.main === module) {
   seed().catch(err => {
     console.error('Error seeding database:', err);
+    process.exitCode = 1;
+  }).finally(() => {
+    prisma.$disconnect();
   });
 }
 

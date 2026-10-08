@@ -1,143 +1,157 @@
 const express = require('express');
-const router = express.Router();
-const { all, get, run } = require('../db/database');
-const { authenticateToken } = require('../middleware/auth');
+const { randomUUID } = require('crypto');
+const prisma = require('../db/database');
+const { authenticateToken, requireAdmin } = require('../middleware/auth');
+const { vehicleResponse } = require('../db/serializers');
+const { isSafeImageUrl } = require('../db/validation');
 
-// GET /api/vehicles (Public)
+const router = express.Router();
+
+function isStringArray(value) {
+  return Array.isArray(value) &&
+    value.length <= 100 &&
+    value.every((item) => typeof item === 'string' && item.length <= 500);
+}
+
+function isImageUrlArray(value) {
+  return Array.isArray(value) && value.length <= 100 && value.every(isSafeImageUrl);
+}
+
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function normalizeSlug(value) {
+  return value.trim().toLowerCase().replace(/\s+/g, '-');
+}
+
+function isValidSlug(value) {
+  return value.length <= 191 && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value);
+}
+
 router.get('/', async (req, res) => {
   try {
-    const vehicles = await all('SELECT * FROM vehicles ORDER BY name ASC');
-    const formatted = vehicles.map(v => ({
-      ...v,
-      features: v.features_json ? JSON.parse(v.features_json) : [],
-      specifications: v.specs_json ? JSON.parse(v.specs_json) : {},
-      gallery: v.gallery_json ? JSON.parse(v.gallery_json) : []
-    }));
-    res.json(formatted);
+    const vehicles = await prisma.vehicle.findMany({ orderBy: { name: 'asc' } });
+    res.json(vehicles.map(vehicleResponse));
   } catch (error) {
     console.error('Error fetching vehicles:', error);
     res.status(500).json({ error: 'Failed to fetch vehicles.' });
   }
 });
 
-// GET /api/vehicles/:slug (Public)
 router.get('/:slug', async (req, res) => {
   try {
     const slug = req.params.slug.toLowerCase();
-    let vehicle = await get('SELECT * FROM vehicles WHERE slug = ?', [slug]);
-    if (!vehicle) {
-      // Fallback to first vehicle if slug not match
-      vehicle = await get('SELECT * FROM vehicles LIMIT 1');
-    }
-    if (!vehicle) {
-      return res.status(404).json({ error: 'Vehicle fitment model not found.' });
-    }
-    res.json({
-      ...vehicle,
-      features: vehicle.features_json ? JSON.parse(vehicle.features_json) : [],
-      specifications: vehicle.specs_json ? JSON.parse(vehicle.specs_json) : {},
-      gallery: vehicle.gallery_json ? JSON.parse(vehicle.gallery_json) : []
-    });
+    const vehicle = await prisma.vehicle.findUnique({ where: { slug } }) ||
+      await prisma.vehicle.findFirst({ orderBy: { createdAt: 'asc' } });
+    if (!vehicle) return res.status(404).json({ error: 'Vehicle fitment model not found.' });
+    res.json(vehicleResponse(vehicle));
   } catch (error) {
     console.error('Error fetching vehicle:', error);
     res.status(500).json({ error: 'Failed to fetch vehicle.' });
   }
 });
 
-// POST /api/vehicles (Admin Protected)
-router.post('/', authenticateToken, async (req, res) => {
+router.post('/', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { name, slug, years, description, features, specifications, gallery } = req.body;
-    if (!name || !slug || !years) {
-      return res.status(400).json({ error: 'Name, slug, and years are required.' });
+    const { name, slug, years, description, features, specifications, gallery } = req.body || {};
+    if (
+      typeof name !== 'string' || !name.trim() ||
+      name.trim().length > 191 ||
+      typeof slug !== 'string' || !slug.trim() ||
+      !isValidSlug(normalizeSlug(slug)) ||
+      typeof years !== 'string' || !years.trim() ||
+      years.trim().length > 64 ||
+      (description !== undefined && (typeof description !== 'string' || description.length > 20000)) ||
+      (features !== undefined && !isStringArray(features)) ||
+      (specifications !== undefined && !isObject(specifications)) ||
+      (specifications !== undefined && Buffer.byteLength(JSON.stringify(specifications)) > 60000) ||
+      (gallery !== undefined && !isImageUrlArray(gallery))
+    ) {
+      return res.status(400).json({ error: 'Name, slug, years, and valid vehicle details are required.' });
     }
 
-    const cleanSlug = slug.toLowerCase().replace(/\s+/g, '-');
-    const existingSlug = await get('SELECT * FROM vehicles WHERE slug = ?', [cleanSlug]);
-    if (existingSlug) {
-      return res.status(400).json({ error: `URL Slug "${cleanSlug}" is already used by ${existingSlug.name}. Please enter a unique slug.` });
+    const cleanSlug = normalizeSlug(slug);
+    const duplicate = await prisma.vehicle.findUnique({ where: { slug: cleanSlug } });
+    if (duplicate) {
+      return res.status(409).json({ error: `URL Slug "${cleanSlug}" is already in use.` });
     }
 
-    const id = 'veh_' + Date.now();
-    const featuresJson = JSON.stringify(Array.isArray(features) ? features : []);
-    const specsJson = JSON.stringify(specifications || {});
-    const galleryJson = JSON.stringify(Array.isArray(gallery) ? gallery : []);
-
-    await run(
-      'INSERT INTO vehicles (id, name, slug, years, description, features_json, specs_json, gallery_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-      [id, name, cleanSlug, years, description || '', featuresJson, specsJson, galleryJson]
-    );
-
-    const created = await get('SELECT * FROM vehicles WHERE id = ?', [id]);
-    res.status(201).json({
-      ...created,
-      features: created.features_json ? JSON.parse(created.features_json) : [],
-      specifications: created.specs_json ? JSON.parse(created.specs_json) : {},
-      gallery: created.gallery_json ? JSON.parse(created.gallery_json) : []
+    const vehicle = await prisma.vehicle.create({
+      data: {
+        id: `veh_${randomUUID()}`,
+        name: name.trim(),
+        slug: cleanSlug,
+        years: years.trim(),
+        description: typeof description === 'string' ? description : '',
+        features: features || [],
+        specifications: specifications || {},
+        gallery: gallery || []
+      }
     });
+    res.status(201).json(vehicleResponse(vehicle));
   } catch (error) {
     console.error('Error creating vehicle:', error);
-    res.status(500).json({ error: error.message || 'Failed to create vehicle fitment model.' });
+    if (error.code === 'P2002') {
+      return res.status(409).json({ error: 'That vehicle slug is already in use.' });
+    }
+    res.status(500).json({ error: 'Failed to create vehicle fitment model.' });
   }
 });
 
-// PUT /api/vehicles/:id (Admin Protected)
-router.put('/:id', authenticateToken, async (req, res) => {
+router.put('/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { name, slug, years, description, features, specifications, gallery } = req.body;
-    const vehicle = await get('SELECT * FROM vehicles WHERE id = ?', [req.params.id]);
-    if (!vehicle) {
-      return res.status(404).json({ error: 'Vehicle not found.' });
+    const existing = await prisma.vehicle.findUnique({ where: { id: req.params.id } });
+    if (!existing) return res.status(404).json({ error: 'Vehicle not found.' });
+
+    const { name, slug, years, description, features, specifications, gallery } = req.body || {};
+    if (
+      (name !== undefined && (typeof name !== 'string' || !name.trim())) ||
+      (slug !== undefined && (typeof slug !== 'string' || !slug.trim())) ||
+      (name !== undefined && name.trim().length > 191) ||
+      (slug !== undefined && !isValidSlug(normalizeSlug(slug))) ||
+      (years !== undefined && (typeof years !== 'string' || !years.trim() || years.trim().length > 64)) ||
+      (description !== undefined && (typeof description !== 'string' || description.length > 20000)) ||
+      (features !== undefined && !isStringArray(features)) ||
+      (specifications !== undefined && !isObject(specifications)) ||
+      (specifications !== undefined && Buffer.byteLength(JSON.stringify(specifications)) > 60000) ||
+      (gallery !== undefined && !isImageUrlArray(gallery))
+    ) {
+      return res.status(400).json({ error: 'Invalid vehicle fields.' });
     }
 
-    const cleanSlug = slug ? slug.toLowerCase().replace(/\s+/g, '-') : vehicle.slug;
-    const existingSlug = await get('SELECT * FROM vehicles WHERE slug = ? AND id != ?', [cleanSlug, req.params.id]);
-    if (existingSlug) {
-      return res.status(400).json({ error: `URL Slug "${cleanSlug}" is already used by ${existingSlug.name}. Please use a unique slug.` });
-    }
-
-    const featuresJson = JSON.stringify(Array.isArray(features) ? features : (vehicle.features_json ? JSON.parse(vehicle.features_json) : []));
-    const specsJson = JSON.stringify(specifications || (vehicle.specs_json ? JSON.parse(vehicle.specs_json) : {}));
-    const galleryJson = JSON.stringify(Array.isArray(gallery) ? gallery : (vehicle.gallery_json ? JSON.parse(vehicle.gallery_json) : []));
-
-    await run(
-      `UPDATE vehicles 
-       SET name = ?, slug = ?, years = ?, description = ?, features_json = ?, specs_json = ?, gallery_json = ? 
-       WHERE id = ?`,
-      [
-        name || vehicle.name,
-        cleanSlug,
-        years || vehicle.years,
-        description !== undefined ? description : vehicle.description,
-        featuresJson,
-        specsJson,
-        galleryJson,
-        req.params.id
-      ]
-    );
-
-    const updated = await get('SELECT * FROM vehicles WHERE id = ?', [req.params.id]);
-    res.json({
-      ...updated,
-      features: updated.features_json ? JSON.parse(updated.features_json) : [],
-      specifications: updated.specs_json ? JSON.parse(updated.specs_json) : {},
-      gallery: updated.gallery_json ? JSON.parse(updated.gallery_json) : []
+    const cleanSlug = slug === undefined ? existing.slug : normalizeSlug(slug);
+    const duplicate = await prisma.vehicle.findFirst({
+      where: { slug: cleanSlug, NOT: { id: existing.id } }
     });
+    if (duplicate) return res.status(409).json({ error: `URL Slug "${cleanSlug}" is already in use.` });
+
+    const vehicle = await prisma.vehicle.update({
+      where: { id: existing.id },
+      data: {
+        ...(name !== undefined && { name: name.trim() }),
+        slug: cleanSlug,
+        ...(years !== undefined && { years: years.trim() }),
+        ...(description !== undefined && { description }),
+        ...(features !== undefined && { features }),
+        ...(specifications !== undefined && { specifications }),
+        ...(gallery !== undefined && { gallery })
+      }
+    });
+    res.json(vehicleResponse(vehicle));
   } catch (error) {
     console.error('Error updating vehicle:', error);
-    res.status(500).json({ error: error.message || 'Failed to update vehicle model.' });
+    if (error.code === 'P2002') {
+      return res.status(409).json({ error: 'That vehicle slug is already in use.' });
+    }
+    res.status(500).json({ error: 'Failed to update vehicle model.' });
   }
 });
 
-// DELETE /api/vehicles/:id (Admin Protected)
-router.delete('/:id', authenticateToken, async (req, res) => {
+router.delete('/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const vehicle = await get('SELECT * FROM vehicles WHERE id = ?', [req.params.id]);
-    if (!vehicle) {
-      return res.status(404).json({ error: 'Vehicle not found.' });
-    }
-
-    await run('DELETE FROM vehicles WHERE id = ?', [req.params.id]);
+    const result = await prisma.vehicle.deleteMany({ where: { id: req.params.id } });
+    if (result.count === 0) return res.status(404).json({ error: 'Vehicle not found.' });
     res.json({ message: 'Vehicle deleted successfully.' });
   } catch (error) {
     console.error('Error deleting vehicle:', error);

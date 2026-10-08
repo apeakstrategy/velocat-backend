@@ -1,46 +1,99 @@
 const express = require('express');
-const router = express.Router();
-const { all, get, run } = require('../db/database');
-const { authenticateToken } = require('../middleware/auth');
+const { randomUUID } = require('crypto');
+const prisma = require('../db/database');
+const { authenticateToken, requireAdmin } = require('../middleware/auth');
+const { inquiryResponse } = require('../db/serializers');
 
-// POST /api/inquiries (Public client submission)
+const router = express.Router();
+const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 router.post('/', async (req, res) => {
   try {
-    const { name, email, phone, notes, selectedOptions, totalEstimate } = req.body;
+    const {
+      name,
+      email,
+      phone,
+      notes,
+      selectedOptionIds
+    } = req.body || {};
 
-    // Validation requirement: At least Email OR Phone MUST be provided
-    const cleanEmail = email ? email.trim() : '';
-    const cleanPhone = phone ? phone.trim() : '';
-
-    if (!cleanEmail && !cleanPhone) {
-      return res.status(400).json({ error: 'Please provide either an Email Address or Phone Number to submit your CAD request.' });
+    const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+    const cleanPhone = typeof phone === 'string' ? phone.trim() : '';
+    if ((!cleanEmail && !cleanPhone) || (cleanEmail && !emailPattern.test(cleanEmail))) {
+      return res.status(400).json({ error: 'Provide a valid email address or phone number.' });
+    }
+    if (
+      cleanEmail.length > 191 || cleanPhone.length > 64 ||
+      (name !== undefined && (typeof name !== 'string' || name.trim().length > 191)) ||
+      (notes !== undefined && (typeof notes !== 'string' || notes.length > 5000)) ||
+      !isRecord(selectedOptionIds)
+    ) {
+      return res.status(400).json({ error: 'Invalid inquiry details.' });
     }
 
-    const id = 'inq_' + Date.now();
-    const optionsJson = JSON.stringify(selectedOptions || {});
+    const requiredSteps = ['vehicle', 'type', 'finish', 'delivery'];
+    if (
+      !requiredSteps.every((step) => typeof selectedOptionIds[step] === 'string') ||
+      Object.keys(selectedOptionIds).some((step) => ![...requiredSteps, 'modules'].includes(step)) ||
+      (selectedOptionIds.modules !== undefined && typeof selectedOptionIds.modules !== 'string')
+    ) {
+      return res.status(400).json({ error: 'Select valid configurator options before submitting.' });
+    }
 
-    await run(
-      `INSERT INTO inquiries (id, client_name, email, phone, notes, selected_options_json, total_estimate, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        name || 'Anonymous Client',
-        cleanEmail,
-        cleanPhone,
-        notes || '',
-        optionsJson,
-        parseFloat(totalEstimate || 0),
-        'New'
-      ]
-    );
+    const optionIds = Object.values(selectedOptionIds);
+    const options = await prisma.configuratorOption.findMany({
+      where: { id: { in: optionIds } }
+    });
+    const optionsById = new Map(options.map((option) => [option.id, option]));
+    const stepIds = ['vehicle', 'type', 'finish', 'delivery'];
+    for (const stepId of stepIds) {
+      const option = optionsById.get(selectedOptionIds[stepId]);
+      if (!option || option.stepId !== stepId) {
+        return res.status(400).json({ error: 'One or more selected configurator options are invalid.' });
+      }
+    }
+    if (selectedOptionIds.modules) {
+      const moduleOption = optionsById.get(selectedOptionIds.modules);
+      if (!moduleOption || moduleOption.stepId !== 'modules') {
+        return res.status(400).json({ error: 'The selected module is invalid.' });
+      }
+    }
 
-    const created = await get('SELECT * FROM inquiries WHERE id = ?', [id]);
+    const selectionNames = {
+      vehicle: optionsById.get(selectedOptionIds.vehicle).name,
+      type: optionsById.get(selectedOptionIds.type).name,
+      module: selectedOptionIds.modules
+        ? optionsById.get(selectedOptionIds.modules).name
+        : 'None',
+      finish: optionsById.get(selectedOptionIds.finish).name,
+      delivery: optionsById.get(selectedOptionIds.delivery).name
+    };
+    const totalCents = ['type', 'modules', 'finish', 'delivery']
+      .reduce((total, stepId) => {
+        const optionId = selectedOptionIds[stepId];
+        return total + (optionId ? Math.round(Number(optionsById.get(optionId).price) * 100) : 0);
+      }, 0);
+    const totalEstimate = totalCents / 100;
+
+    const inquiry = await prisma.inquiry.create({
+      data: {
+        id: `inq_${randomUUID()}`,
+        clientName: typeof name === 'string' && name.trim() ? name.trim() : 'Anonymous Client',
+        email: cleanEmail,
+        phone: cleanPhone,
+        notes: typeof notes === 'string' ? notes.trim() : '',
+        selectedOptions: selectionNames,
+        totalEstimate
+      }
+    });
+
     res.status(201).json({
       message: 'CAD Engineering Package Inquiry submitted successfully.',
-      inquiry: {
-        ...created,
-        selectedOptions: created.selected_options_json ? JSON.parse(created.selected_options_json) : {}
-      }
+      inquiry: inquiryResponse(inquiry)
     });
   } catch (error) {
     console.error('Error submitting inquiry:', error);
@@ -48,51 +101,39 @@ router.post('/', async (req, res) => {
   }
 });
 
-// GET /api/inquiries (Admin Protected)
-router.get('/', authenticateToken, async (req, res) => {
+router.get('/', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const inquiries = await all('SELECT * FROM inquiries ORDER BY created_at DESC');
-    const formatted = inquiries.map(inq => ({
-      ...inq,
-      selectedOptions: inq.selected_options_json ? JSON.parse(inq.selected_options_json) : {}
-    }));
-    res.json(formatted);
+    const inquiries = await prisma.inquiry.findMany({ orderBy: { createdAt: 'desc' } });
+    res.json(inquiries.map(inquiryResponse));
   } catch (error) {
     console.error('Error fetching inquiries:', error);
     res.status(500).json({ error: 'Failed to fetch inquiries.' });
   }
 });
 
-// PUT /api/inquiries/:id (Admin Protected)
-router.put('/:id', authenticateToken, async (req, res) => {
+router.put('/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const { status } = req.body;
-    const inquiry = await get('SELECT * FROM inquiries WHERE id = ?', [req.params.id]);
-    if (!inquiry) {
-      return res.status(404).json({ error: 'Inquiry not found.' });
+    const { status } = req.body || {};
+    if (!['New', 'In Progress', 'Completed', 'Archived'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid inquiry status.' });
     }
-
-    await run('UPDATE inquiries SET status = ? WHERE id = ?', [status || inquiry.status, req.params.id]);
-    const updated = await get('SELECT * FROM inquiries WHERE id = ?', [req.params.id]);
-    res.json({
-      ...updated,
-      selectedOptions: updated.selected_options_json ? JSON.parse(updated.selected_options_json) : {}
+    const result = await prisma.inquiry.updateMany({
+      where: { id: req.params.id },
+      data: { status }
     });
+    if (result.count === 0) return res.status(404).json({ error: 'Inquiry not found.' });
+    const inquiry = await prisma.inquiry.findUnique({ where: { id: req.params.id } });
+    res.json(inquiryResponse(inquiry));
   } catch (error) {
     console.error('Error updating inquiry status:', error);
     res.status(500).json({ error: 'Failed to update inquiry status.' });
   }
 });
 
-// DELETE /api/inquiries/:id (Admin Protected)
-router.delete('/:id', authenticateToken, async (req, res) => {
+router.delete('/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    const inquiry = await get('SELECT * FROM inquiries WHERE id = ?', [req.params.id]);
-    if (!inquiry) {
-      return res.status(404).json({ error: 'Inquiry not found.' });
-    }
-
-    await run('DELETE FROM inquiries WHERE id = ?', [req.params.id]);
+    const result = await prisma.inquiry.deleteMany({ where: { id: req.params.id } });
+    if (result.count === 0) return res.status(404).json({ error: 'Inquiry not found.' });
     res.json({ message: 'Inquiry deleted successfully.' });
   } catch (error) {
     console.error('Error deleting inquiry:', error);
